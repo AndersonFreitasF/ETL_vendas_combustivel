@@ -1,4 +1,6 @@
 import pandas as pd
+import requests
+import os
 from sqlalchemy import create_engine, text
 import logging
 from datetime import datetime
@@ -6,12 +8,27 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
 URL_FONTE = "https://www.gov.br/anp/pt-br/centrais-de-conteudo/dados-abertos/arquivos/shpc/dsan/2024/precos-gasolina-etanol-01.csv"
+PLACEHOLDER = "temp_dados_anp.csv"
 TABELA_DESTINO = "vendas_combustivel"
+
 
 def get_db_engine():
     return create_engine(f'sqlite:///anp_2024.db')
 
-def transform_chunk(df_chunk):
+def download_file():
+    try:
+        with requests.get(URL_FONTE, stream=True, timeout=60) as r:
+            r.raise_for_status()
+            with open(PLACEHOLDER, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=8192): 
+                    f.write(chunk)
+        logging.info("Download concluído com sucesso!")
+        return True
+    except Exception as e:
+        logging.error(f"Erro fatal no download: {e}")
+        return False
+
+def clean_and_transform(df_chunk):
     cols_map = {
         'Regiao - Sigla': 'regiao',
         'Estado - Sigla': 'uf',
@@ -36,22 +53,30 @@ def transform_chunk(df_chunk):
     if 'data_coleta' in df_clean.columns:
         df_clean['data_coleta'] = pd.to_datetime(df_clean['data_coleta'], format='%d/%m/%Y', errors='coerce')
 
+    df_clean = df_clean.drop_duplicates()
+
+    colunas_criticas = ['valor_venda', 'data_coleta', 'cnpj', 'produto']
+    df_clean = df_clean.dropna(subset=colunas_criticas)
+
+    df_clean = df_clean[df_clean['valor_venda'] > 0.01]
+
+    cols_texto = ['regiao', 'uf', 'municipio', 'posto_nome', 'bairro', 'bandeira', 'produto']
+    for col in cols_texto:
+        if col in df_clean.columns:
+            df_clean[col] = df_clean[col].astype(str).str.strip().str.upper()
+
     return df_clean
 
-def run_pipeline_stream():
-    start_time = datetime.now()
-    logging.info(f"--- INICIANDO PIPELINE ETL ---")
-    
+def run_pipeline_db():
+    logging.info("--- 2. PROCESSANDO ARQUIVO LOCAL PARA O BANCO ---")
     engine = get_db_engine()
-    storage_options = {'User-Agent': 'Mozilla/5.0'}
     
     try:
         chunks = pd.read_csv(
-            URL_FONTE, 
+            PLACEHOLDER, 
             sep=';', 
-            encoding='utf-8', 
+            encoding='utf-8',
             chunksize=5000,
-            storage_options=storage_options,
             on_bad_lines='skip'
         )
         
@@ -59,80 +84,62 @@ def run_pipeline_stream():
         modo_escrita = 'replace' 
         
         for i, chunk in enumerate(chunks):
-            df_limpo = transform_chunk(chunk)
+            df_limpo = clean_and_transform(chunk)
             
-            df_limpo.to_sql(TABELA_DESTINO, con=engine, if_exists=modo_escrita, index=False)
+            if not df_limpo.empty:
+                df_limpo.to_sql(TABELA_DESTINO, con=engine, if_exists=modo_escrita, index=False)
+                modo_escrita = 'append'
+                total_linhas += len(df_limpo)
             
-            modo_escrita = 'append'
-            total_linhas += len(df_limpo)
-            
-            if i % 5 == 0:
-                logging.info(f"Processando lote {i}... Linhas acumuladas: {total_linhas}")
+            if i % 10 == 0:
+                logging.info(f"Lote {i} processado. Linhas salvas: {total_linhas}")
                 
-    except Exception as e:
-        logging.error(f"Erro: {e}")
-        return
+        logging.info(f"--- SUCESSO! Total carregado: {total_linhas} registros. ---")
+        return True
 
-    logging.info(f"Total registros: {total_linhas}. Tempo: {datetime.now() - start_time} ---")
+    except Exception as e:
+        logging.error(f"Erro no processamento do banco: {e}")
+        return False
+    finally:
+        if os.path.exists(PLACEHOLDER):
+            os.remove(PLACEHOLDER)
+            logging.info("Arquivo temporário limpo.")
 
 def check_results_completo():
-    logging.info("Gerando Relatório Gerencial...")
+    logging.info("--- 3. GERANDO RELATÓRIO GERENCIAL ---")
     engine = get_db_engine()
     
     try:
         with engine.connect() as con:
-            print("\n=======================================================")
-            print("   RESUMO DE PREÇOS (R$ / Litro)")
-            print("=======================================================")
+            print("\n=== RESUMO DE PREÇOS (R$ / Litro) ===")
             query_geral = """
             SELECT 
                 produto, 
-                COUNT(*) as 'Qtd Amostras',
-                ROUND(MIN(valor_venda), 2) as 'Min (R$)',
+                COUNT(*) as 'Qtd',
                 ROUND(AVG(valor_venda), 2) as 'Média (R$)',
+                ROUND(MIN(valor_venda), 2) as 'Min (R$)',
                 ROUND(MAX(valor_venda), 2) as 'Max (R$)'
             FROM vendas_combustivel 
             GROUP BY produto
-            ORDER BY produto
             """
-            df_geral = pd.read_sql(text(query_geral), con)
-            print(df_geral.to_string(index=False))
+            print(pd.read_sql(text(query_geral), con).to_string(index=False))
 
-            print("\n\n=======================================================")
-            print("   ANÁLISE REGIONAL (Onde há mais postos pesquisados?)")
-            print("=======================================================")
-            query_regiao = """
-            SELECT 
-                regiao,
-                produto,
-                COUNT(*) as 'Qtd Postos',
-                ROUND(AVG(valor_venda), 2) as 'Preço Médio Regional (R$)'
-            FROM vendas_combustivel
-            GROUP BY regiao, produto
-            ORDER BY regiao, produto
-            """
-            df_regiao = pd.read_sql(text(query_regiao), con)
-            print(df_regiao.to_string(index=False))
-
-            print("\n\n=======================================================")
-            print("   TOP 5 ESTADOS MAIS CAROS - GASOLINA")
-            print("=======================================================")
+            print("\n=== TOP 5 ESTADOS MAIS CAROS (GASOLINA) ===")
             query_top = """
-            SELECT 
-                uf,
-                ROUND(AVG(valor_venda), 2) as 'Média Gasolina (R$)'
-            FROM vendas_combustivel
-            WHERE produto = 'GASOLINA'
-            GROUP BY uf
-            ORDER BY "Média Gasolina (R$)" DESC
-            LIMIT 5
+            SELECT uf, ROUND(AVG(valor_venda), 2) as 'Média R$'
+            FROM vendas_combustivel WHERE produto = 'GASOLINA'
+            GROUP BY uf ORDER BY "Média R$" DESC LIMIT 5
             """
-            df_top = pd.read_sql(text(query_top), con)
-            print(df_top.to_string(index=False))
+            print(pd.read_sql(text(query_top), con).to_string(index=False))
 
     except Exception as e:
-        print("Erro na análise:", e)
+        print(f"Não foi possível gerar o relatório. Motivo: {e}")
 
 if __name__ == "__main__":
-    run_pipeline_stream()
-    check_results_completo()
+    if download_file():
+        if run_pipeline_db():
+            check_results_completo()
+        else:
+            print("Falha na etapa de Banco de Dados.")
+    else:
+        print("Falha no Download.")

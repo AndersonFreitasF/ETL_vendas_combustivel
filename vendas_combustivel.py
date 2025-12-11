@@ -22,7 +22,7 @@ def get_db_engine():
 def download_file():
     logging.info(f"Iniciando download da fonte: {URL_FONTE}")
     try:
-        response = requests.get(URL_FONTE, stream=True, timeout=60)
+        response = requests.get(URL_FONTE, stream=True, timeout=1024)
         response.raise_for_status()
 
         with open(PLACEHOLDER, "wb") as file:
@@ -40,7 +40,6 @@ def download_file():
 
 def detectar_colunas(df_chunk):
     colmap = {}
-    
     logging.info(f"Colunas brutas encontradas: {list(df_chunk.columns)}")
 
     for col in df_chunk.columns:
@@ -100,11 +99,7 @@ def clean_and_transform(df_chunk):
             )
 
     if "valor_venda" in df.columns:
-        df["valor_venda"] = (
-            df["valor_venda"]
-            .astype(str)
-            .str.replace(",", ".", regex=False)
-        )
+        df["valor_venda"] = df["valor_venda"].astype(str).str.replace(",", ".", regex=False)
         df["valor_venda"] = pd.to_numeric(df["valor_venda"], errors="coerce")
 
     if "data_coleta" in df.columns:
@@ -114,12 +109,9 @@ def clean_and_transform(df_chunk):
         df["cnpj"] = df["cnpj"].astype(str).str.replace(r"\D", "", regex=True)
 
     criticas = ["valor_venda", "produto", "data_coleta"]
-    criticas_presentes = [c for c in criticas if c in df.columns]
-    df.dropna(subset=criticas_presentes, inplace=True)
+    df.dropna(subset=criticas, inplace=True)
 
-    if "valor_venda" in df.columns:
-        df = df[df["valor_venda"] > 0.01]
-
+    df = df[df["valor_venda"] > 0.01]
     df.drop_duplicates(inplace=True)
 
     qtd_final = len(df)
@@ -130,7 +122,6 @@ def clean_and_transform(df_chunk):
 
 def run_pipeline_db():
     logging.info("Iniciando pipeline de carga no banco de dados.")
-
     engine = get_db_engine()
 
     try:
@@ -182,41 +173,48 @@ def run_pipeline_db():
             except Exception as del_err:
                 logging.error(f"Falha ao tentar remover arquivo temporário: {del_err}")
 
-def check_results_completo():
+def check_results_completo(estado_filtro=None):
     logging.info("Gerando relatórios de validação...")
     engine = get_db_engine()
+
+    filtro_sql = ""
+    if estado_filtro:
+        filtro_sql = f"WHERE uf = '{estado_filtro.upper()}'"
+        logging.info(f"Aplicando filtro UF = {estado_filtro.upper()}")
 
     try:
         with engine.connect() as con:
 
             print("\n=== RESUMO POR PRODUTO ===")
-            print(pd.read_sql(text("""
+            print(pd.read_sql(text(f"""
                 SELECT produto,
                        COUNT(*) AS qtd,
                        ROUND(AVG(valor_venda), 2) AS media,
                        ROUND(MIN(valor_venda), 2) AS minimo,
                        ROUND(MAX(valor_venda), 2) AS maximo
                 FROM vendas_combustivel
+                {filtro_sql}
                 GROUP BY produto;
             """), con).to_string(index=False))
 
             print("\n=== TOP 5 ESTADOS MAIS CAROS (GASOLINA) ===")
-            print(pd.read_sql(text("""
+            print(pd.read_sql(text(f"""
                 SELECT uf,
                        ROUND(AVG(valor_venda), 2) AS media
                 FROM vendas_combustivel
                 WHERE produto='GASOLINA'
+                {f"AND uf='{estado_filtro.upper()}'" if estado_filtro else ""}
                 GROUP BY uf
                 ORDER BY media DESC
                 LIMIT 5;
             """), con).to_string(index=False))
 
             print("\n=== MEDIANA POR PRODUTO ===")
-            print(pd.read_sql(text("""
+            print(pd.read_sql(text(f"""
                 WITH base AS (
                     SELECT produto, valor_venda
                     FROM vendas_combustivel
-                    WHERE valor_venda IS NOT NULL
+                    {filtro_sql}
                 ),
                 ordered AS (
                     SELECT produto, valor_venda,
@@ -232,16 +230,17 @@ def check_results_completo():
             """), con).to_string(index=False))
 
             print("\n=== VOLUME TOTAL POR PRODUTO ===")
-            print(pd.read_sql(text("""
+            print(pd.read_sql(text(f"""
                 SELECT produto,
                        COUNT(*) AS total_registros
                 FROM vendas_combustivel
+                {filtro_sql}
                 GROUP BY produto
                 ORDER BY total_registros DESC;
             """), con).to_string(index=False))
 
             print("\n=== DISTRIBUIÇÃO DE PREÇOS POR PRODUTO ===")
-            print(pd.read_sql(text("""
+            print(pd.read_sql(text(f"""
                 SELECT produto,
                        SUM(CASE WHEN valor_venda < 4 THEN 1 ELSE 0 END) AS faixa_ate_4,
                        SUM(CASE WHEN valor_venda >= 4 AND valor_venda < 5 THEN 1 ELSE 0 END) AS faixa_4_5,
@@ -249,6 +248,7 @@ def check_results_completo():
                        SUM(CASE WHEN valor_venda >= 6 AND valor_venda < 7 THEN 1 ELSE 0 END) AS faixa_6_7,
                        SUM(CASE WHEN valor_venda >= 7 THEN 1 ELSE 0 END) AS faixa_acima_7
                 FROM vendas_combustivel
+                {filtro_sql}
                 GROUP BY produto;
             """), con).to_string(index=False))
 
@@ -261,7 +261,7 @@ if __name__ == "__main__":
     logging.info("=== INÍCIO DO PROCESSO ===")
     if download_file():
         if run_pipeline_db():
-            check_results_completo()
+            check_results_completo(estado_filtro="AL")
         else:
             logging.error("Ocorreu um erro na etapa de carga do banco.")
     else:

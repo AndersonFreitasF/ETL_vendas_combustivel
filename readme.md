@@ -12,7 +12,7 @@ Pipeline para extração, transformação e análise de dados de preços de comb
 ## Requisitos
 
 ```bash
-pip install pandas sqlalchemy
+pip install pandas sqlalchemy requests
 ```
 
 ## Execução
